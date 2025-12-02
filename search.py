@@ -5,6 +5,9 @@ import os.path
 import time
 from nltk.stem import PorterStemmer
 from collections import defaultdict
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
 
 class Indexer:
     def __init__(self, collectionPath, indexPath, stopwordPath):
@@ -395,58 +398,102 @@ class Indexer:
 
         postings.insert(insertIndex, (docID, [position]))
 
+@app.route('/search', methods=['GET'])
+def startServer():
+    """Handle GET requests for search queries."""
+    query = request.args.get('q', '')
+    method = request.args.get('method', 'boolean')
+
+    if not query:
+        return jsonify({'error': 'Missing query parameter "q"'}), 400
+
+    if method == 'boolean':
+        results = indexer.queryWithBoolean(query)
+        return jsonify({
+            'method': 'boolean',
+            'query': query,
+            'results': results
+        })
+    elif method == 'tfidf':
+        results, _ = indexer.queryWithTfIdf(query)
+        results = list(map(lambda x: x[0], results))
+        return jsonify({
+            'method': 'tfidf',
+            'query': query,
+            'results': results,
+        })
+    else:
+        return jsonify({'error': 'Invalid method. Use "boolean" or "tfidf".'}), 400
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--collection-path', type=str, default='collections/trec.sample.xml', help='Path to search in')
     parser.add_argument('--index-path', type=str, default='index.txt', help='Path to index file')
     parser.add_argument('--stopword-path', type=str, default='stop_words.txt', help='Path to stopword file')
+    parser.add_argument('--mode', default='server', choices=['server', 'console'], help='Mode to run the search engine')
     parser.add_argument('--search-method', default='boolean', choices=['boolean', 'tfidf'], help='Search method to use')
     args = parser.parse_args()
 
-    if not args.collection_path.endswith('.xml'):
-        raise ValueError("The path must point to a XML file.")
+    if args.mode == 'server':
+        indexer = Indexer('collections/trec.sample.xml', 'index.txt', 'stop_words.txt')
+        if not os.path.isfile('index.txt'):
+            print(f"Index file '{args.index_path}' does not exist. Building index...")
+            startTime = time.time()
+            indexer.buildIndex()
+            endTime = time.time()
+            print(f"Generate the index file for {endTime - startTime} seconds.")
+        else:
+            print(f"Index file '{args.index_path}' already exists. Skipping indexing process.")
+            startTime = time.time()
+            indexer.loadIndex()
+            endTime = time.time()
+            print(f"Load the index file for {endTime - startTime} seconds.")
+        app.run(host='0.0.0.0', port=5050, debug=True)
+    elif args.mode == 'console':
+        if not args.collection_path.endswith('.xml'):
+            raise ValueError("The path must point to a XML file.")
 
-    collectionFile = open(args.collection_path, 'r')
-    indexer = Indexer(args.collection_path, args.index_path, args.stopword_path)
+        collectionFile = open(args.collection_path, 'r')
+        indexer = Indexer(args.collection_path, args.index_path, args.stopword_path)
 
-    if not os.path.isfile(args.index_path):
-        print(f"Index file '{args.index_path}' does not exist. Building index...")
-        startTime = time.time()
-        indexer.buildIndex()
-        endTime = time.time()
-        print(f"Generate the index file for {endTime - startTime} seconds.")
-    else:
-        print(f"Index file '{args.index_path}' already exists. Skipping indexing process.")
-        startTime = time.time()
-        indexer.loadIndex()
-        endTime = time.time()
-        print(f"Load the index file for {endTime - startTime} seconds.")
+        if not os.path.isfile(args.index_path):
+            print(f"Index file '{args.index_path}' does not exist. Building index...")
+            startTime = time.time()
+            indexer.buildIndex()
+            endTime = time.time()
+            print(f"Generate the index file for {endTime - startTime} seconds.")
+        else:
+            print(f"Index file '{args.index_path}' already exists. Skipping indexing process.")
+            startTime = time.time()
+            indexer.loadIndex()
+            endTime = time.time()
+            print(f"Load the index file for {endTime - startTime} seconds.")
 
-    print(f"Index loaded with {len(indexer.index)} terms.")
+        print(f"Index loaded with {len(indexer.index)} terms.")
+        if args.search_method == 'boolean':
+            print('Enter your search query with boolean search (or type "EXIT" to quit):')
 
-    if args.search_method == 'boolean':
-        print('Enter your search query with boolean search (or type "EXIT" to quit):')
+            while True:
+                query = input("> ")
+                if query == 'EXIT':
+                    print('Good Bye!')
+                    exit()
 
-        while True:
-            query = input("> ")
-            if query == 'EXIT':
-                print('Good Bye!')
-                exit()
+                docIDs = indexer.queryWithBoolean(query)
+                if docIDs != -1:
+                    print(docIDs)
+                    print(f'Total {len(docIDs)} documents found.')
+        elif args.search_method == 'tfidf':
+            print('Enter your search query with TFIDF search (or type "EXIT" to quit):')
 
-            docIDs = indexer.queryWithBoolean(query)
-            if docIDs != -1:
-                print(docIDs)
-                print(f'Total {len(docIDs)} documents found.')
-    elif args.search_method == 'tfidf':
-        print('Enter your search query with TFIDF search (or type "EXIT" to quit):')
+            while True:
+                query = input("> ")
+                if query == 'EXIT':
+                    print('Good Bye!')
+                    exit()
 
-        while True:
-            query = input("> ")
-            if query == 'EXIT':
-                print('Good Bye!')
-                exit()
-
-            results, suggestedTerms = indexer.queryWithTfIdf(query)
-            print(f'Top Documents: {results[:5]}')
-            print(f'Suggested Terms: {suggestedTerms}')
-            print(f'Total {len(results)} documents found.')
+                results, suggestedTerms = indexer.queryWithTfIdf(query)
+                print(f'Top Documents: {results[:5]}')
+                print(f'Suggested Terms: {suggestedTerms}')
+                print(f'Total {len(results)} documents found.')
