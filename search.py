@@ -288,6 +288,79 @@ def startServer():
         return jsonify({'error': 'Invalid method. Use "term" or "tfidf".'}), 400
 
 
+@app.route('/document', methods=['GET'])
+def getDocumentById():
+    """Handle GET requests to retrieve the original document by its ID, including headline."""
+    doc_id = request.args.get('id', None)
+    if doc_id is None:
+        return jsonify({'error': 'Missing document ID parameter "id"'}), 400
+
+    try:
+        doc_id = int(doc_id)
+    except ValueError:
+        return jsonify({'error': 'Invalid document ID format. Must be an integer.'}), 400
+
+    collection_path = indexer.collectionPath
+    if not os.path.exists(collection_path):
+        return jsonify({'error': f'Collection file not found at {collection_path}'}), 500
+
+    document_text = ''
+    headline_text = ''
+    inside_text = False
+    inside_headline = False
+    inside_docno = False
+    doc_num_str = ''
+    doc_num = -1
+    buffer = [''] * 20
+
+    with open(collection_path, 'r') as collection_file:
+        char = collection_file.read(1)
+        while char != '':
+            buffer.pop(0)
+            buffer.append(char)
+            candidate_str = ''.join(buffer).lower()
+
+            if candidate_str.endswith('<text>'):
+                inside_text = True
+                document_text = ''
+            elif candidate_str.endswith('</text>'):
+                inside_text = False
+                if doc_num == doc_id:
+                    document_text = document_text[:-len('</text')]
+                    return jsonify({
+                        'doc_id': doc_id,
+                        'headline': headline_text.strip(),
+                        'content': document_text.strip()
+                    })
+                document_text = ''
+                headline_text = ''
+                doc_num = -1
+                doc_num_str = ''
+            elif candidate_str.endswith('<headline>'):
+                inside_headline = True
+                headline_text = ''
+            elif candidate_str.endswith('</headline>'):
+                inside_headline = False
+                headline_text = headline_text[:-len('</headline')]
+            elif candidate_str.endswith('<docno>'):
+                inside_docno = True
+                doc_num_str = ''
+            elif candidate_str.endswith('</docno>'):
+                inside_docno = False
+                try:
+                    doc_num = int(doc_num_str.lower()[:-len('</docno')].strip())
+                except ValueError:
+                    doc_num = -1
+            elif inside_docno:
+                doc_num_str += char
+            elif inside_text:
+                document_text += char
+            elif inside_headline:
+                headline_text += char
+            char = collection_file.read(1)
+
+    return jsonify({'error': f'Document with ID {doc_id} not found'}), 404
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--collection-path', type=str, default='collections/trec.sample.xml', help='Path to search in')
