@@ -1,0 +1,452 @@
+import argparse
+import re
+import math
+import os.path
+import time
+from nltk.stem import PorterStemmer
+from collections import defaultdict
+
+class Indexer:
+    def __init__(self, collectionPath, indexPath, stopwordPath):
+        self.index = defaultdict(list) # term --> List of (docID, [positions])
+        self.documentFrequency = defaultdict(int) # term --> df
+        self.totalNumOfDoc = 0
+        self.collectionPath = collectionPath
+        self.indexPath = indexPath
+        self.stemmer = PorterStemmer()
+        self.stopWords = set()
+        self.removeStopWords = True
+        self.punctuations = ['.', '?', '!', ',', ';', ':', '-', '—']
+        self.separator = ['-', '—', '/', '_', '$', '#', '@', '&']
+        with open(stopwordPath, 'r') as F:
+            for line in F:
+                self.stopWords.add(line.strip())
+
+    def buildIndex(self):
+        collectionFile = open(self.collectionPath, 'r')
+        maxNumBuffer = 20
+        docNumStr = ''
+        docNum = -1
+        documentText = ''
+
+        buffer = [''] * maxNumBuffer
+        insideText = False
+        insideDocNo = False
+        self.totalNumOfDoc = 0
+
+        char = collectionFile.read(1)
+        while char != '':  # read file until EOF
+            buffer.pop(0)
+            buffer.append(char)
+            candidateStr = ''.join(buffer).lower()
+
+            if candidateStr.endswith('<text>'):
+                insideText = True
+            elif candidateStr.endswith('</text>'):
+                insideText = False
+                if docNum != -1:
+                    documentText = documentText[:-len('</text')]
+                    for term, position in self.__preprocessIndex(documentText):
+                        self.__addNewTerm(self.index, term, docNum, position)
+                documentText = ''
+                docNum = -1
+                docNumStr = ''
+                self.totalNumOfDoc += 1
+            elif candidateStr.endswith('<headline>'):
+                insideText = True
+            elif candidateStr.endswith('</headline>'):
+                documentText = documentText[:-len('</headline')]
+                documentText += '\n'
+                insideText = False
+            elif candidateStr.endswith('<docno>'):
+                insideDocNo = True
+            elif candidateStr.endswith('</docno>'):
+                insideDocNo = False
+                docNum = int(docNumStr.lower()[:-len('</docno')].strip())
+                
+            elif insideDocNo:
+                docNumStr += char
+            elif insideText:
+                documentText += char
+            char = collectionFile.read(1)
+
+        for term, docs in self.index.items():
+            self.documentFrequency[term] = len(docs)
+
+        with open(self.indexPath, 'w') as F:
+            for term in sorted(self.index.keys()):
+                postingStr = ''
+                df = self.documentFrequency[term]
+                for docID, positions in self.index[term]:
+                    postingStr += f"\t{docID}: {','.join(map(str, positions))}\n"
+                F.write(f"{term}:{df}\n{postingStr}\n\n")
+
+    def loadIndex(self):
+        self.index = defaultdict(list)
+        with open(self.indexPath, 'r') as F:
+            content = F.read()
+            entries = content.strip().split('\n\n')
+            for entry in entries:
+                lines = entry.strip().split('\n')
+                term = lines[0].split(':')[0]
+                df = int(lines[0].split(':')[1])
+                postings = []
+                
+                for line in lines[1:]:
+                    if line.strip() == '':
+                        continue
+                    docPart = line.strip().split(':')
+                    docID = int(docPart[0].strip())
+                    positions = list(map(int, docPart[1].strip().split(',')))
+                    postings.append((docID, positions))
+                self.index[term] = postings
+                self.documentFrequency[term] = df
+
+            self.totalNumOfDoc = len({docID for postings in self.index.values() for docID, _ in postings})
+
+    def queryWithBoolean(self, queryString):
+        stacks = []
+        commands = self.__preprocessQueryString(queryString)
+
+        for command in commands:
+            if not command in ['AND', 'OR', 'AND NOT'] and not command.startswith('#'):
+                currentDocs = []
+                terms = command.split(' ')
+                for idx, term in enumerate(terms):
+                    if idx == 0:
+                        currentDocs = self.__getDocs(term)
+                    else:
+                        currentDocs = self.__phraseSearch(currentDocs, [term])
+
+                if len(stacks) == 0:
+                    stacks.append(currentDocs)
+                elif stacks[-1] == 'AND':
+                    stacks.pop()
+                    stacks.append(self.__intersection(stacks.pop(), currentDocs))
+                elif stacks[-1] == 'OR':
+                    stacks.pop()
+                    stacks.append(self.__union(stacks.pop(), currentDocs))
+
+            elif not command in ['AND', 'OR'] and command.startswith('#'):
+                currentDocs = []
+                distance = int(command[1 : command.index('(')])
+                phrase1 = command[command.index('(') + 1: command.index(',')]
+                phrase2 = command[command.index(',') + 1: command.index(')')]
+                phrase1Docs = self.__getDocs(phrase1)
+                currentDocs = self.__phraseSearch(phrase1Docs, [phrase2], distance)
+
+                if len(stacks) == 0:
+                    stacks.append(currentDocs)
+                elif stacks[-1] == 'AND':
+                    stacks.pop()
+                    stacks.append(self.__intersection(stacks.pop(), currentDocs))
+                elif stacks[-1] == 'OR':
+                    stacks.pop()
+                    stacks.append(self.__union(stacks.pop(), currentDocs))
+            else:
+                stacks.append(command)
+
+        return list(map(lambda x: x[0], stacks[-1])) if len(stacks) > 0 else []
+
+    def queryWithTfIdf(self, queryString, topDocs=150, numSuggestedTerms=5, numPRFDocs=1):
+        commands = self.__tokenize(queryString)
+        docScores = defaultdict(float)
+
+        for term in commands:
+            if term in self.index:
+                postings = self.index[term]
+                for docID, positions in postings:
+                    tf = len(positions)
+                    df = self.documentFrequency[term]
+                    docScores[docID] += (1 + math.log10(tf)) * math.log10(self.totalNumOfDoc / df)
+
+        docRanked = sorted(docScores.items(), key=lambda x: x[1], reverse=True)
+        suggestedTerms = self.__PRF(docRanked, numPRFDocs, numSuggestedTerms)  # Suggest terms by PRF
+        return docRanked[:topDocs], suggestedTerms
+
+    def __phraseSearch(self, currentDocs, terms, distance=1):
+        for term in terms:
+            matchedDocs = []
+            nextDocs = self.__getDocs(term)
+            i, j = 0, 0
+
+            # Find matched DocIDs
+            while i < len(currentDocs) and j < len(nextDocs):
+                if currentDocs[i][0] == nextDocs[j][0]:
+                    # Find matched phrase
+                    currentPositions = currentDocs[i][1]
+                    nextPositions = nextDocs[j][1]
+                    m, n = 0, 0
+                    while m < len(currentPositions) and n < len(nextPositions):
+                        diff = nextPositions[n] - currentPositions[m]
+                        if 0 < diff and diff <= distance:
+                            nextDocID = nextDocs[j][0]
+                            found = False
+                            for doc in matchedDocs:
+                                if doc[0] == nextDocID:
+                                    doc[1].append(nextPositions[n])
+                                    found = True
+                                    break
+
+                            if not found:
+                                matchedDocs.append((nextDocID, [nextPositions[n]]))
+
+                            n += 1
+                        elif diff > distance:
+                            m += 1
+                        else:
+                            n += 1
+                    i += 1
+                    j += 1
+                elif currentDocs[i][0] > nextDocs[j][0]:
+                    j += 1
+                else:
+                    i += 1
+
+            currentDocs = matchedDocs
+
+        return currentDocs
+
+    def __getDocs(self, term):
+        return self.index[term]
+
+    def __intersection(self, docs1, docs2):
+        i, j = 0, 0
+        intersection = []
+        while i < len(docs1) and j < len(docs2):
+            if docs1[i][0] == docs2[j][0]:
+                intersection.append(docs1[i])
+                i += 1
+                j += 1
+            elif docs1[i][0] < docs2[j][0]:
+                i += 1
+            else:
+                j += 1
+
+        return intersection
+    
+    def __union(self, docs1, docs2):
+        i, j = 0, 0
+        union = []
+        while i < len(docs1) and j < len(docs2):
+            if docs1[i][0] == docs2[j][0]:
+                union.append(docs1[i])
+                i += 1
+                j += 1
+            elif docs1[i][0] < docs2[j][0]:
+                union.append(docs1[i])
+                i += 1
+            else:
+                union.append(docs2[j])
+                j += 1
+        while i < len(docs1):
+            union.append(docs1[i])
+            i += 1
+        while j < len(docs2):
+            union.append(docs2[j])
+            j += 1
+
+        return union
+
+    def __PRF(self, initDocScores, numTopInitDocs=1, numReturnTopTerms=5):
+        initTopDocs = initDocScores[:numTopInitDocs]
+        collectionFile = open(self.collectionPath, 'r')
+        index = defaultdict(list)
+        tfidf = defaultdict(float)
+        maxNumBuffer = 20
+        buffer = [''] * maxNumBuffer
+        insideText = False
+        insideDocNo = False
+        docNumStr = ''
+        docNum = -1
+        documentText = ''
+
+        # Create a set of document IDs to quickly lookup which ones to extract
+        topDocIDs = set(list(map(lambda x: x[0], initTopDocs)))
+
+        char = collectionFile.read(1)
+        while char != '':  # Read until EOF
+            buffer.pop(0)
+            buffer.append(char)
+            candidateStr = ''.join(buffer).lower()
+            
+            if candidateStr.endswith('<text>'):
+                insideText = True
+            elif candidateStr.endswith('</text>'):
+                insideText = False
+                if docNum in topDocIDs:
+                    documentText = documentText[:-len('</text')]
+                    for term, position in self.__preprocessIndex(documentText):
+                        self.__addNewTerm(index, term, docNum, position)
+                documentText = ''
+                docNum = -1
+                docNumStr = ''
+            elif candidateStr.endswith('<headline>'):
+                insideText = True
+            elif candidateStr.endswith('</headline>'):
+                documentText = documentText[:-len('</headline')]
+                documentText += '\n'
+                insideText = False
+            elif candidateStr.endswith('<docno>'):
+                insideDocNo = True
+            elif candidateStr.endswith('</docno>'):
+                insideDocNo = False
+                docNum = int(docNumStr.lower()[:-len('</docno')].strip())
+            elif insideDocNo:
+                docNumStr += char
+            elif insideText:
+                documentText += char
+            char = collectionFile.read(1)
+        
+        collectionFile.close()
+
+        for term, postings in index.items():
+            tf = sum(len(positions) for _, positions in postings)
+            tfidf[term] = tf * math.log10(self.totalNumOfDoc / self.documentFrequency[term])
+
+        return sorted(tfidf.items(), key=lambda x: x[1], reverse=True)[:numReturnTopTerms]
+
+    def __preprocessIndex(self, sentence):
+        terms = self.__tokenize(sentence)
+        terms = [(term, idx + 1) for idx, term in enumerate(terms)]  # Add positions
+    
+        return terms
+
+    def __preprocessQueryString(self, queryString):
+        queryString = queryString.strip()
+        queryString = re.split(r"(\s+AND NOT\s+|\s+AND\s+|\s+OR\s+)", queryString, maxsplit=1)
+        queryString = list(map(lambda x: x.strip(), queryString))
+        
+        for idx, command in enumerate(queryString):
+            if not command in ['AND', 'OR', 'AND NOT'] and not re.match(r"^#\d+\(", command):
+                tmp = self.__tokenize(command)
+                tmp = ' '.join(tmp)
+                queryString[idx] = tmp
+            elif not command in ['AND', 'OR', 'AND NOT'] and re.match(r"^#\d+\(", command):
+                command = command.replace(' ', '')
+                distanceCommand = command[0 : command.index('(')]
+                phrase1 = command[command.index('(') + 1: command.index(',')]
+                phrase2 = command[command.index(',') + 1: command.index(')')]
+                phrase1 = self.__tokenize(phrase1)
+                phrase2 = self.__tokenize(phrase2)
+                queryString[idx] = f'{distanceCommand}({phrase1[0]},{phrase2[0]})'
+
+        return queryString
+            
+
+    def __tokenize(self, sentence):
+        terms = []
+        sentence = sentence.strip()
+        sentence = sentence.lower()
+        sentence = sentence.replace('\n', ' ')
+        sentence = sentence.replace('\r', ' ')
+        sentence = sentence.split(' ')
+        for word in sentence:
+            candidates = []
+            if word != '' and word[-1] in self.punctuations:
+                word = word[:-1]
+
+            for sep in self.separator:
+                if sep in word:
+                    for w in word.split(sep):
+                        if w != '' and (not w in self.stopWords or not self.removeStopWords):
+                            w = self.__cleanTerm(w)
+                            w = self.stemmer.stem(w)
+                            candidates.append(w)
+
+                    break
+
+            if len(candidates) == 0:
+                word = self.__cleanTerm(word)
+                if word != '' and (not word in self.stopWords or not self.removeStopWords):
+                    word = self.stemmer.stem(word)
+                    candidates.append(word)
+
+            terms.extend(candidates)
+
+        return terms
+    
+    def __cleanTerm(self, term):
+        processedTerm = ''
+        for c in term:
+            if c.isalnum():
+                processedTerm += c
+
+        return processedTerm
+
+    def __addNewTerm(self, index, term, docID, position):
+        postings = index[term]
+        for i, (dID, positions) in enumerate(postings):
+            if dID == docID:
+                # Insert position in sorted order
+                j = len(positions) - 1
+                while j >= 0 and positions[j] > position:
+                    j -= 1
+                positions.insert(j + 1, position)
+                postings[i] = (dID, positions)
+                return
+
+        # Insert (docID, [position]) in sorted order by docID
+        insertIndex = len(postings)
+        for i, (existingDocID, _) in enumerate(postings):
+            if existingDocID > docID:
+                insertIndex = i
+                break
+
+        postings.insert(insertIndex, (docID, [position]))
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--collection-path', type=str, default='collections/trec.sample.xml', help='Path to search in')
+    parser.add_argument('--index-path', type=str, default='index.txt', help='Path to index file')
+    parser.add_argument('--stopword-path', type=str, default='stop_words.txt', help='Path to stopword file')
+    parser.add_argument('--search-method', default='boolean', choices=['boolean', 'tfidf'], help='Search method to use')
+    args = parser.parse_args()
+
+    if not args.collection_path.endswith('.xml'):
+        raise ValueError("The path must point to a XML file.")
+
+    collectionFile = open(args.collection_path, 'r')
+    indexer = Indexer(args.collection_path, args.index_path, args.stopword_path)
+
+    if not os.path.isfile(args.index_path):
+        print(f"Index file '{args.index_path}' does not exist. Building index...")
+        startTime = time.time()
+        indexer.buildIndex()
+        endTime = time.time()
+        print(f"Generate the index file for {endTime - startTime} seconds.")
+    else:
+        print(f"Index file '{args.index_path}' already exists. Skipping indexing process.")
+        startTime = time.time()
+        indexer.loadIndex()
+        endTime = time.time()
+        print(f"Load the index file for {endTime - startTime} seconds.")
+
+    print(f"Index loaded with {len(indexer.index)} terms.")
+
+    if args.search_method == 'boolean':
+        print('Enter your search query with boolean search (or type "EXIT" to quit):')
+
+        while True:
+            query = input("> ")
+            if query == 'EXIT':
+                print('Good Bye!')
+                exit()
+
+            docIDs = indexer.queryWithBoolean(query)
+            if docIDs != -1:
+                print(docIDs)
+                print(f'Total {len(docIDs)} documents found.')
+    elif args.search_method == 'tfidf':
+        print('Enter your search query with TFIDF search (or type "EXIT" to quit):')
+
+        while True:
+            query = input("> ")
+            if query == 'EXIT':
+                print('Good Bye!')
+                exit()
+
+            results, suggestedTerms = indexer.queryWithTfIdf(query)
+            print(f'Top Documents: {results[:5]}')
+            print(f'Suggested Terms: {suggestedTerms}')
+            print(f'Total {len(results)} documents found.')
