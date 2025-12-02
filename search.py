@@ -107,49 +107,14 @@ class Indexer:
 
             self.totalNumOfDoc = len({docID for postings in self.index.values() for docID, _ in postings})
 
-    def queryWithBoolean(self, queryString):
-        stacks = []
-        commands = self.__preprocessQueryString(queryString)
-
-        for command in commands:
-            if not command in ['AND', 'OR', 'AND NOT'] and not command.startswith('#'):
-                currentDocs = []
-                terms = command.split(' ')
-                for idx, term in enumerate(terms):
-                    if idx == 0:
-                        currentDocs = self.__getDocs(term)
-                    else:
-                        currentDocs = self.__phraseSearch(currentDocs, [term])
-
-                if len(stacks) == 0:
-                    stacks.append(currentDocs)
-                elif stacks[-1] == 'AND':
-                    stacks.pop()
-                    stacks.append(self.__intersection(stacks.pop(), currentDocs))
-                elif stacks[-1] == 'OR':
-                    stacks.pop()
-                    stacks.append(self.__union(stacks.pop(), currentDocs))
-
-            elif not command in ['AND', 'OR'] and command.startswith('#'):
-                currentDocs = []
-                distance = int(command[1 : command.index('(')])
-                phrase1 = command[command.index('(') + 1: command.index(',')]
-                phrase2 = command[command.index(',') + 1: command.index(')')]
-                phrase1Docs = self.__getDocs(phrase1)
-                currentDocs = self.__phraseSearch(phrase1Docs, [phrase2], distance)
-
-                if len(stacks) == 0:
-                    stacks.append(currentDocs)
-                elif stacks[-1] == 'AND':
-                    stacks.pop()
-                    stacks.append(self.__intersection(stacks.pop(), currentDocs))
-                elif stacks[-1] == 'OR':
-                    stacks.pop()
-                    stacks.append(self.__union(stacks.pop(), currentDocs))
-            else:
-                stacks.append(command)
-
-        return list(map(lambda x: x[0], stacks[-1])) if len(stacks) > 0 else []
+    def queryWithTerm(self, queryString):
+        finalDocs = set()
+        tokens = self.__tokenize(queryString.strip())
+        for token in tokens:
+            docIDs = list(map(lambda x: x[0], self.__getDocs(token)))
+            for docID in docIDs:
+                finalDocs.add(docID)
+        return list(finalDocs) if len(finalDocs) > 0 else []
 
     def queryWithTfIdf(self, queryString, topDocs=150, numSuggestedTerms=5, numPRFDocs=1):
         commands = self.__tokenize(queryString)
@@ -167,89 +132,8 @@ class Indexer:
         suggestedTerms = self.__PRF(docRanked, numPRFDocs, numSuggestedTerms)  # Suggest terms by PRF
         return docRanked[:topDocs], suggestedTerms
 
-    def __phraseSearch(self, currentDocs, terms, distance=1):
-        for term in terms:
-            matchedDocs = []
-            nextDocs = self.__getDocs(term)
-            i, j = 0, 0
-
-            # Find matched DocIDs
-            while i < len(currentDocs) and j < len(nextDocs):
-                if currentDocs[i][0] == nextDocs[j][0]:
-                    # Find matched phrase
-                    currentPositions = currentDocs[i][1]
-                    nextPositions = nextDocs[j][1]
-                    m, n = 0, 0
-                    while m < len(currentPositions) and n < len(nextPositions):
-                        diff = nextPositions[n] - currentPositions[m]
-                        if 0 < diff and diff <= distance:
-                            nextDocID = nextDocs[j][0]
-                            found = False
-                            for doc in matchedDocs:
-                                if doc[0] == nextDocID:
-                                    doc[1].append(nextPositions[n])
-                                    found = True
-                                    break
-
-                            if not found:
-                                matchedDocs.append((nextDocID, [nextPositions[n]]))
-
-                            n += 1
-                        elif diff > distance:
-                            m += 1
-                        else:
-                            n += 1
-                    i += 1
-                    j += 1
-                elif currentDocs[i][0] > nextDocs[j][0]:
-                    j += 1
-                else:
-                    i += 1
-
-            currentDocs = matchedDocs
-
-        return currentDocs
-
     def __getDocs(self, term):
         return self.index[term]
-
-    def __intersection(self, docs1, docs2):
-        i, j = 0, 0
-        intersection = []
-        while i < len(docs1) and j < len(docs2):
-            if docs1[i][0] == docs2[j][0]:
-                intersection.append(docs1[i])
-                i += 1
-                j += 1
-            elif docs1[i][0] < docs2[j][0]:
-                i += 1
-            else:
-                j += 1
-
-        return intersection
-    
-    def __union(self, docs1, docs2):
-        i, j = 0, 0
-        union = []
-        while i < len(docs1) and j < len(docs2):
-            if docs1[i][0] == docs2[j][0]:
-                union.append(docs1[i])
-                i += 1
-                j += 1
-            elif docs1[i][0] < docs2[j][0]:
-                union.append(docs1[i])
-                i += 1
-            else:
-                union.append(docs2[j])
-                j += 1
-        while i < len(docs1):
-            union.append(docs1[i])
-            i += 1
-        while j < len(docs2):
-            union.append(docs2[j])
-            j += 1
-
-        return union
 
     def __PRF(self, initDocScores, numTopInitDocs=1, numReturnTopTerms=5):
         initTopDocs = initDocScores[:numTopInitDocs]
@@ -314,28 +198,6 @@ class Indexer:
         terms = [(term, idx + 1) for idx, term in enumerate(terms)]  # Add positions
     
         return terms
-
-    def __preprocessQueryString(self, queryString):
-        queryString = queryString.strip()
-        queryString = re.split(r"(\s+AND NOT\s+|\s+AND\s+|\s+OR\s+)", queryString, maxsplit=1)
-        queryString = list(map(lambda x: x.strip(), queryString))
-        
-        for idx, command in enumerate(queryString):
-            if not command in ['AND', 'OR', 'AND NOT'] and not re.match(r"^#\d+\(", command):
-                tmp = self.__tokenize(command)
-                tmp = ' '.join(tmp)
-                queryString[idx] = tmp
-            elif not command in ['AND', 'OR', 'AND NOT'] and re.match(r"^#\d+\(", command):
-                command = command.replace(' ', '')
-                distanceCommand = command[0 : command.index('(')]
-                phrase1 = command[command.index('(') + 1: command.index(',')]
-                phrase2 = command[command.index(',') + 1: command.index(')')]
-                phrase1 = self.__tokenize(phrase1)
-                phrase2 = self.__tokenize(phrase2)
-                queryString[idx] = f'{distanceCommand}({phrase1[0]},{phrase2[0]})'
-
-        return queryString
-            
 
     def __tokenize(self, sentence):
         terms = []
@@ -402,15 +264,15 @@ class Indexer:
 def startServer():
     """Handle GET requests for search queries."""
     query = request.args.get('q', '')
-    method = request.args.get('method', 'boolean')
+    method = request.args.get('method', 'term')
 
     if not query:
         return jsonify({'error': 'Missing query parameter "q"'}), 400
 
-    if method == 'boolean':
-        results = indexer.queryWithBoolean(query)
+    if method == 'term':
+        results = indexer.queryWithTerm(query)
         return jsonify({
-            'method': 'boolean',
+            'method': 'term',
             'query': query,
             'results': results
         })
@@ -423,7 +285,7 @@ def startServer():
             'results': results,
         })
     else:
-        return jsonify({'error': 'Invalid method. Use "boolean" or "tfidf".'}), 400
+        return jsonify({'error': 'Invalid method. Use "term" or "tfidf".'}), 400
 
 
 if __name__ == '__main__':
@@ -432,7 +294,7 @@ if __name__ == '__main__':
     parser.add_argument('--index-path', type=str, default='index.txt', help='Path to index file')
     parser.add_argument('--stopword-path', type=str, default='stop_words.txt', help='Path to stopword file')
     parser.add_argument('--mode', default='server', choices=['server', 'console'], help='Mode to run the search engine')
-    parser.add_argument('--search-method', default='boolean', choices=['boolean', 'tfidf'], help='Search method to use')
+    parser.add_argument('--search-method', default='term', choices=['term', 'tfidf'], help='Search method to use')
     args = parser.parse_args()
 
     if args.mode == 'server':
@@ -471,8 +333,8 @@ if __name__ == '__main__':
             print(f"Load the index file for {endTime - startTime} seconds.")
 
         print(f"Index loaded with {len(indexer.index)} terms.")
-        if args.search_method == 'boolean':
-            print('Enter your search query with boolean search (or type "EXIT" to quit):')
+        if args.search_method == 'term':
+            print('Enter your search query with term search (or type "EXIT" to quit):')
 
             while True:
                 query = input("> ")
@@ -480,7 +342,7 @@ if __name__ == '__main__':
                     print('Good Bye!')
                     exit()
 
-                docIDs = indexer.queryWithBoolean(query)
+                docIDs = indexer.queryWithTerm(query)
                 if docIDs != -1:
                     print(docIDs)
                     print(f'Total {len(docIDs)} documents found.')
