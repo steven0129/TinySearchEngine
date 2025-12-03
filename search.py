@@ -116,7 +116,7 @@ class Indexer:
                 finalDocs.add(docID)
         return list(finalDocs) if len(finalDocs) > 0 else []
 
-    def queryWithTfIdf(self, queryString, topDocs=150, numSuggestedTerms=5, numPRFDocs=1):
+    def queryWithTfIdf(self, queryString, topDocs=150):
         commands = self.__tokenize(queryString)
         docScores = defaultdict(float)
 
@@ -129,69 +129,10 @@ class Indexer:
                     docScores[docID] += (1 + math.log10(tf)) * math.log10(self.totalNumOfDoc / df)
 
         docRanked = sorted(docScores.items(), key=lambda x: x[1], reverse=True)
-        suggestedTerms = self.__PRF(docRanked, numPRFDocs, numSuggestedTerms)  # Suggest terms by PRF
-        return docRanked[:topDocs], suggestedTerms
+        return docRanked[:topDocs]
 
     def __getDocs(self, term):
         return self.index[term]
-
-    def __PRF(self, initDocScores, numTopInitDocs=1, numReturnTopTerms=5):
-        initTopDocs = initDocScores[:numTopInitDocs]
-        collectionFile = open(self.collectionPath, 'r')
-        index = defaultdict(list)
-        tfidf = defaultdict(float)
-        maxNumBuffer = 20
-        buffer = [''] * maxNumBuffer
-        insideText = False
-        insideDocNo = False
-        docNumStr = ''
-        docNum = -1
-        documentText = ''
-
-        # Create a set of document IDs to quickly lookup which ones to extract
-        topDocIDs = set(list(map(lambda x: x[0], initTopDocs)))
-
-        char = collectionFile.read(1)
-        while char != '':  # Read until EOF
-            buffer.pop(0)
-            buffer.append(char)
-            candidateStr = ''.join(buffer).lower()
-            
-            if candidateStr.endswith('<text>'):
-                insideText = True
-            elif candidateStr.endswith('</text>'):
-                insideText = False
-                if docNum in topDocIDs:
-                    documentText = documentText[:-len('</text')]
-                    for term, position in self.__preprocessIndex(documentText):
-                        self.__addNewTerm(index, term, docNum, position)
-                documentText = ''
-                docNum = -1
-                docNumStr = ''
-            elif candidateStr.endswith('<headline>'):
-                insideText = True
-            elif candidateStr.endswith('</headline>'):
-                documentText = documentText[:-len('</headline')]
-                documentText += '\n'
-                insideText = False
-            elif candidateStr.endswith('<docno>'):
-                insideDocNo = True
-            elif candidateStr.endswith('</docno>'):
-                insideDocNo = False
-                docNum = int(docNumStr.lower()[:-len('</docno')].strip())
-            elif insideDocNo:
-                docNumStr += char
-            elif insideText:
-                documentText += char
-            char = collectionFile.read(1)
-        
-        collectionFile.close()
-
-        for term, postings in index.items():
-            tf = sum(len(positions) for _, positions in postings)
-            tfidf[term] = tf * math.log10(self.totalNumOfDoc / self.documentFrequency[term])
-
-        return sorted(tfidf.items(), key=lambda x: x[1], reverse=True)[:numReturnTopTerms]
 
     def __preprocessIndex(self, sentence):
         terms = self.__tokenize(sentence)
@@ -297,7 +238,7 @@ def application(environ, start_response):
                     results = indexer.queryWithTerm(query)
                     response = {'method': 'term', 'query': query, 'results': results}
                 elif method == 'tfidf':
-                    results, _ = indexer.queryWithTfIdf(query)
+                    results = indexer.queryWithTfIdf(query)
                     results = list(map(lambda x: x[0], results))
                     response = {'method': 'tfidf', 'query': query, 'results': results}
                 else:
@@ -420,7 +361,6 @@ if __name__ == '__main__':
                     print('Good Bye!')
                     exit()
 
-                results, suggestedTerms = indexer.queryWithTfIdf(query)
+                results = indexer.queryWithTfIdf(query)
                 print(f'Top Documents: {results[:5]}')
-                print(f'Suggested Terms: {suggestedTerms}')
                 print(f'Total {len(results)} documents found.')
