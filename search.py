@@ -5,11 +5,9 @@ import os.path
 import time
 from nltk.stem import PorterStemmer
 from collections import defaultdict
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
+from wsgiref.simple_server import make_server
+import json
+from urllib.parse import parse_qs
 
 class Indexer:
     def __init__(self, collectionPath, indexPath, stopwordPath):
@@ -262,106 +260,85 @@ class Indexer:
 
         postings.insert(insertIndex, (docID, [position]))
 
-@app.route('/search', methods=['GET'])
-def startServer():
-    """Handle GET requests for search queries."""
-    query = request.args.get('q', '')
-    method = request.args.get('method', 'term')
-
-    if not query:
-        return jsonify({'error': 'Missing query parameter "q"'}), 400
-
-    if method == 'term':
-        results = indexer.queryWithTerm(query)
-        return jsonify({
-            'method': 'term',
-            'query': query,
-            'results': results
-        })
-    elif method == 'tfidf':
-        results, _ = indexer.queryWithTfIdf(query)
-        results = list(map(lambda x: x[0], results))
-        return jsonify({
-            'method': 'tfidf',
-            'query': query,
-            'results': results,
-        })
-    else:
-        return jsonify({'error': 'Invalid method. Use "term" or "tfidf".'}), 400
-
-
-@app.route('/document', methods=['GET'])
-def getDocumentById():
-    """Handle GET requests to retrieve the original document by its ID, including headline."""
-    doc_id = request.args.get('id', None)
-    if doc_id is None:
-        return jsonify({'error': 'Missing document ID parameter "id"'}), 400
-
+def application(environ, start_response):
     try:
-        doc_id = int(doc_id)
-    except ValueError:
-        return jsonify({'error': 'Invalid document ID format. Must be an integer.'}), 400
+        path = environ.get('PATH_INFO', '')
+        query_params = parse_qs(environ.get('QUERY_STRING', ''))
+        status = '200 OK'
+        headers = [('Content-Type', 'application/json'), ('Access-Control-Allow-Origin', '*')]
 
-    collection_path = indexer.collectionPath
-    if not os.path.exists(collection_path):
-        return jsonify({'error': f'Collection file not found at {collection_path}'}), 500
+        # Root endpoint
+        if path == '/':
+            response = {'message': 'SimpleSearchEngine WSGI server is running'}
+            start_response(status, headers)
+            return [json.dumps(response).encode('utf-8')]
 
-    document_text = ''
-    headline_text = ''
-    inside_text = False
-    inside_headline = False
-    inside_docno = False
-    doc_num_str = ''
-    doc_num = -1
-    buffer = [''] * 20
+        # Search endpoint
+        if path == '/search':
+            query = query_params.get('q', [''])[0]
+            method = query_params.get('method', ['term'])[0]
 
-    with open(collection_path, 'r') as collection_file:
-        char = collection_file.read(1)
-        while char != '':
-            buffer.pop(0)
-            buffer.append(char)
-            candidate_str = ''.join(buffer).lower()
+            if not query:
+                status = '400 Bad Request'
+                response = {'error': 'Missing query parameter "q"'}
+            else:
+                start_time = time.time()
+                if method == 'term':
+                    results = indexer.queryWithTerm(query)
+                    response = {'method': 'term', 'query': query, 'results': results}
+                elif method == 'tfidf':
+                    results, _ = indexer.queryWithTfIdf(query)
+                    results = list(map(lambda x: x[0], results))
+                    response = {'method': 'tfidf', 'query': query, 'results': results}
+                else:
+                    status = '400 Bad Request'
+                    response = {'error': 'Invalid method. Use "term" or "tfidf".'}
+                response['elapsed_time'] = round(time.time() - start_time, 4)
 
-            if candidate_str.endswith('<text>'):
-                inside_text = True
-                document_text = ''
-            elif candidate_str.endswith('</text>'):
-                inside_text = False
-                if doc_num == doc_id:
-                    document_text = document_text[:-len('</text')]
-                    return jsonify({
-                        'doc_id': doc_id,
-                        'headline': headline_text.strip(),
-                        'content': document_text.strip()
-                    })
-                document_text = ''
-                headline_text = ''
-                doc_num = -1
-                doc_num_str = ''
-            elif candidate_str.endswith('<headline>'):
-                inside_headline = True
-                headline_text = ''
-            elif candidate_str.endswith('</headline>'):
-                inside_headline = False
-                headline_text = headline_text[:-len('</headline')]
-            elif candidate_str.endswith('<docno>'):
-                inside_docno = True
-                doc_num_str = ''
-            elif candidate_str.endswith('</docno>'):
-                inside_docno = False
+        # Document endpoint
+        elif path == '/document':
+            doc_id = query_params.get('id', [None])[0]
+            if doc_id is None:
+                status = '400 Bad Request'
+                response = {'error': 'Missing document ID parameter "id"'}
+            else:
                 try:
-                    doc_num = int(doc_num_str.lower()[:-len('</docno')].strip())
+                    doc_id = int(doc_id)
                 except ValueError:
-                    doc_num = -1
-            elif inside_docno:
-                doc_num_str += char
-            elif inside_text:
-                document_text += char
-            elif inside_headline:
-                headline_text += char
-            char = collection_file.read(1)
+                    status = '400 Bad Request'
+                    response = {'error': 'Invalid document ID format. Must be an integer.'}
+                else:
+                    collection_path = indexer.collectionPath
+                    if not os.path.exists(collection_path):
+                        status = '500 Internal Server Error'
+                        response = {'error': f'Collection file not found at {collection_path}'}
+                    else:
+                        # Simplified and non-blocking XML parsing
+                        with open(collection_path, 'r') as f:
+                            content = f.read()
 
-    return jsonify({'error': f'Document with ID {doc_id} not found'}), 404
+                        # Use regex to extract document by ID
+                        import re
+                        pattern = re.compile(rf"<docno>\s*{doc_id}\s*</docno>.*?<headline>(.*?)</headline>.*?<text>(.*?)</text>", re.DOTALL | re.IGNORECASE)
+                        match = pattern.search(content)
+                        if match:
+                            headline = match.group(1).strip()
+                            text = match.group(2).strip()
+                            response = {'doc_id': doc_id, 'headline': headline, 'content': text}
+                        else:
+                            status = '404 Not Found'
+                            response = {'error': f'Document with ID {doc_id} not found'}
+
+        else:
+            status = '404 Not Found'
+            response = {'error': 'Invalid endpoint'}
+
+    except Exception as e:
+        status = '500 Internal Server Error'
+        response = {'error': str(e)}
+
+    start_response(status, headers)
+    return [json.dumps(response).encode('utf-8')]
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -386,7 +363,9 @@ if __name__ == '__main__':
             indexer.loadIndex()
             endTime = time.time()
             print(f"Load the index file for {endTime - startTime} seconds.")
-        app.run(host='0.0.0.0', port=5050, debug=True)
+        with make_server('0.0.0.0', 5050, application) as httpd:
+            print("Serving on port 5050...")
+            httpd.serve_forever()
     elif args.mode == 'console':
         if not args.collection_path.endswith('.xml'):
             raise ValueError("The path must point to a XML file.")
