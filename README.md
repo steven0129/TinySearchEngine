@@ -2,16 +2,10 @@
 
 ## Quick Start
 
-Use one terminal to start API server
+Type the following command to start the search engine.
 
 ```bash
 python search.py
-```
-
-Use the other terminal to start the website
-
-```
-node web_ui.js
 ```
 
 Open your browser and go to http://localhost:3000.

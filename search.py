@@ -260,6 +260,8 @@ class Indexer:
 
         postings.insert(insertIndex, (docID, [position]))
 
+import mimetypes
+
 def application(environ, start_response):
     try:
         path = environ.get('PATH_INFO', '')
@@ -267,11 +269,19 @@ def application(environ, start_response):
         status = '200 OK'
         headers = [('Content-Type', 'application/json'), ('Access-Control-Allow-Origin', '*')]
 
-        # Root endpoint
-        if path == '/':
-            response = {'message': 'SimpleSearchEngine WSGI server is running'}
-            start_response(status, headers)
-            return [json.dumps(response).encode('utf-8')]
+        # Serve static files from /public
+        if path == '/' or path == '/index.html':
+            file_path = os.path.join('public', 'index.html')
+        else:
+            file_path = os.path.join('public', path.lstrip('/'))
+
+        if os.path.isfile(file_path):
+            mime_type, _ = mimetypes.guess_type(file_path)
+            mime_type = mime_type or 'text/plain'
+            headers = [('Content-Type', mime_type)]
+            start_response('200 OK', headers)
+            with open(file_path, 'rb') as f:
+                return [f.read()]
 
         # Search endpoint
         if path == '/search':
@@ -364,7 +374,8 @@ if __name__ == '__main__':
             endTime = time.time()
             print(f"Load the index file for {endTime - startTime} seconds.")
         with make_server('0.0.0.0', 5050, application) as httpd:
-            print("Serving on port 5050...")
+            print("Serving integrated web UI and API on port 5050...")
+            print("Visit http://localhost:5050 in your browser.")
             httpd.serve_forever()
     elif args.mode == 'console':
         if not args.collection_path.endswith('.xml'):
