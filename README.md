@@ -14,6 +14,6 @@ Type the following command to start the search engine.
 python search.py
 ```
 
-Open your browser and go to http://localhost:3000.
+Open your browser and go to http://localhost:5050.
 
 ![](./demo.gif)

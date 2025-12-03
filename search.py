@@ -9,6 +9,11 @@ from wsgiref.simple_server import make_server
 import json
 from urllib.parse import parse_qs
 
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import pickle
+from sklearn.metrics.pairwise import cosine_similarity
+
 class Indexer:
     def __init__(self, collectionPath, indexPath, stopwordPath):
         self.index = defaultdict(list) # term --> List of (docID, [positions])
@@ -24,6 +29,8 @@ class Indexer:
         with open(stopwordPath, 'r') as F:
             for line in F:
                 self.stopWords.add(line.strip())
+
+        self.buildEmbeddings()
 
     def buildIndex(self):
         collectionFile = open(self.collectionPath, 'r')
@@ -201,6 +208,78 @@ class Indexer:
 
         postings.insert(insertIndex, (docID, [position]))
 
+    def buildEmbeddings(self, embedding_path='embeddings.pkl'):
+        if os.path.isfile(embedding_path):
+            print(f"Embeddings file '{embedding_path}' already exists. Skipping embedding generation.")
+            return
+
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("Generating document embeddings...")
+
+        collectionFile = open(self.collectionPath, 'r')
+        maxNumBuffer = 20
+        buffer = [''] * maxNumBuffer
+        insideText = False
+        insideDocNo = False
+        docNumStr = ''
+        docNum = -1
+        documentText = ''
+        docs = []
+        doc_ids = []
+
+        char = collectionFile.read(1)
+        while char != '':
+            buffer.pop(0)
+            buffer.append(char)
+            candidateStr = ''.join(buffer).lower()
+
+            if candidateStr.endswith('<text>'):
+                insideText = True
+            elif candidateStr.endswith('</text>'):
+                insideText = False
+                if docNum != -1:
+                    documentText = documentText[:-len('</text')]
+                    docs.append(documentText.strip())
+                    doc_ids.append(docNum)
+                documentText = ''
+                docNum = -1
+                docNumStr = ''
+            elif candidateStr.endswith('<headline>'):
+                insideText = True
+            elif candidateStr.endswith('</headline>'):
+                documentText = documentText[:-len('</headline')]
+                documentText += '\n'
+                insideText = False
+            elif candidateStr.endswith('<docno>'):
+                insideDocNo = True
+            elif candidateStr.endswith('</docno>'):
+                insideDocNo = False
+                docNum = int(docNumStr.lower()[:-len('</docno')].strip())
+            elif insideDocNo:
+                docNumStr += char
+            elif insideText:
+                documentText += char
+            char = collectionFile.read(1)
+
+        collectionFile.close()
+
+        embeddings = model.encode(docs, show_progress_bar=True)
+        with open(embedding_path, 'wb') as f:
+            pickle.dump({'doc_ids': doc_ids, 'embeddings': embeddings}, f)
+        print(f"Saved embeddings to {embedding_path}")
+
+    def embedding(self, query, embedding_path='embeddings.pkl', top_k=10):
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        with open(embedding_path, 'rb') as f:
+            data = pickle.load(f)
+        doc_ids = data['doc_ids']
+        doc_embeddings = data['embeddings']
+        query_embedding = model.encode([query])
+        similarities = cosine_similarity(query_embedding, doc_embeddings)[0]
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        top_docs = [(int(doc_ids[i]), float(similarities[i])) for i in top_indices]
+        return top_docs
+
 import mimetypes
 
 def application(environ, start_response):
@@ -241,10 +320,14 @@ def application(environ, start_response):
                     results = indexer.queryWithTfIdf(query)
                     results = list(map(lambda x: x[0], results))
                     response = {'method': 'tfidf', 'query': query, 'results': results}
+                elif method == 'embedding':
+                    results = indexer.embedding(query)
+                    results = list(map(lambda x: x[0], results))
+                    response = {'method': 'embedding', 'query': query, 'results': results}
                 else:
                     status = '400 Bad Request'
-                    response = {'error': 'Invalid method. Use "term" or "tfidf".'}
-                response['elapsed_time'] = round(time.time() - start_time, 4)
+                    response = {'error': 'Invalid method. Use "term", "tfidf", or "embedding".'}
+                    response['elapsed_time'] = round(time.time() - start_time, 4)
 
         # Document endpoint
         elif path == '/document':
